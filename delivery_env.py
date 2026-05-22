@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from itertools import permutations
 from typing import Any
 
 import gymnasium as gym
@@ -35,19 +36,8 @@ class DeliveryEnv(gym.Env):
 
     STEP_REWARD = config.STEP_REWARD
     ILLEGAL_REWARD = config.ILLEGAL_REWARD
-    
-    # 3 package types: 0=red, 1=blue, 2=yellow
-    PACKAGE_TYPES = config.PACKAGE_TYPES
-    PICKUP_REWARDS = {
-        0: config.RED_PICKUP_REWARD,
-        1: config.BLUE_PICKUP_REWARD,
-        2: config.YELLOW_PICKUP_REWARD,
-    }
-    DROPOFF_REWARDS = {
-        0: config.RED_DROPOFF_REWARD,
-        1: config.BLUE_DROPOFF_REWARD,
-        2: config.YELLOW_DROPOFF_REWARD,
-    }
+    PICKUP_REWARD = config.PICKUP_REWARD
+    DROPOFF_REWARD = config.DROPOFF_REWARD
 
     def __init__(
         self,
@@ -92,16 +82,20 @@ class DeliveryEnv(gym.Env):
         self.pickup_locations = ((1, 1), (1, 8), (8, 1), (8, 8))
         self.dropoff_locations = ((0, 5), (5, 0), (5, 9), (9, 5))
         self.depot_position = (0, 0)
+        # Planters (grass) — each pair is at least 3 Manhattan distance
+        # apart (i.e. 2 empty squares between them).  These are impassable.
         self.planter_locations = (
-            (1, 2),
-            (4, 2),
-            (5, 3),
+            (1, 3),
+            (3, 1),
+            (1, 7),
+            (3, 8),
+            (6, 1),
             (8, 3),
-            (1, 6),
-            (4, 7),
-            (5, 6),
-            (8, 7),
+            (6, 8),
+            (8, 6),
         )
+        self.grass_cells = set(self.planter_locations)
+
         self.streetlight_locations = (
             (1, 0),
             (4, 1),
@@ -117,29 +111,39 @@ class DeliveryEnv(gym.Env):
             for y in range(self.grid_size)
             for x in range(self.grid_size)
             if (x, y) not in self.buildings
+            and (x, y) not in self.grass_cells
         )
 
         self.action_space = spaces.Discrete(6)
 
-        # The state is still one discrete value, but it also includes the
-        # active pickup/dropoff IDs so randomized jobs remain learnable.
+        # All possible pickup-to-dropoff permutations (4! = 24)
+        self._all_perms = list(permutations(range(len(self.dropoff_locations))))
+        self._num_perms = len(self._all_perms)  # 24
+        self.perm_index = 0
+
+        # 4 packages × 3 statuses × 24 permutations
+        # State = position (100) × pkg_statuses (81) × perm (24) = 194,400
+        self._status_combos = 3 ** len(self.pickup_locations)
         self.observation_space = spaces.Discrete(
-            self.grid_size
-            * self.grid_size
-            * 2
-            * len(self.pickup_locations)
-            * len(self.dropoff_locations)
-            * self.PACKAGE_TYPES
+            self.grid_size * self.grid_size * self._status_combos * self._num_perms
         )
 
         self.robot_position = np.array([0, 0], dtype=np.int8)
-        self.pickup_index = 0
-        self.dropoff_index = 0
-        self.carrying_package = False
-        self.package_type = 0  # 0=red, 1=blue, 2=yellow
+        self.num_packages = len(self.pickup_locations)  # always 4
+        self.max_carry = config.MAX_CARRY
+        # 0 = waiting at pickup, 1 = carried, 2 = delivered
+        self.package_status = [0] * self.num_packages
         self.delivered = False
         self.steps_taken = 0
         self.last_event = "reset"
+
+        # Per-package colors for rendering
+        self.package_colors = [
+            (255, 214, 64),   # Gold
+            (64, 224, 208),   # Teal
+            (255, 105, 180),  # Pink
+            (144, 238, 144),  # Lime
+        ]
 
         self.window_size = 600
         self.cell_size = self.window_size // self.grid_size
@@ -148,54 +152,68 @@ class DeliveryEnv(gym.Env):
         self._pygame = None
 
     @property
-    def pickup_position(self) -> tuple[int, int]:
-        return self.pickup_locations[self.pickup_index]
+    def num_carrying(self) -> int:
+        return sum(1 for s in self.package_status if s == 1)
 
     @property
-    def dropoff_position(self) -> tuple[int, int]:
-        return self.dropoff_locations[self.dropoff_index]
+    def num_delivered(self) -> int:
+        return sum(1 for s in self.package_status if s == 2)
+
+    def _pkg_dropoff(self, pkg_id: int) -> tuple[int, int]:
+        """Return the dropoff location for *pkg_id* under the current permutation."""
+        return self.dropoff_locations[self._all_perms[self.perm_index][pkg_id]]
+
+    def _encode_pkg_status(self) -> int:
+        code = 0
+        for s in self.package_status:
+            code = code * 3 + s
+        return code
+
+    def _decode_pkg_status(self, code: int) -> list[int]:
+        statuses = []
+        for _ in range(self.num_packages):
+            statuses.append(code % 3)
+            code //= 3
+        return list(reversed(statuses))
 
     def _encode_state(self) -> int:
         x, y = (int(v) for v in self.robot_position)
-        state = x
-        state = state * self.grid_size + y
-        state = state * 2 + int(self.carrying_package)
-        state = state * len(self.pickup_locations) + self.pickup_index
-        state = state * len(self.dropoff_locations) + self.dropoff_index
-        state = state * self.PACKAGE_TYPES + self.package_type
-        return int(state)
+        pos = x * self.grid_size + y
+        return (pos * self._status_combos + self._encode_pkg_status()) * self._num_perms + self.perm_index
 
     def decode_state(self, state: int) -> dict[str, Any]:
         """Decode a discrete state index for debugging and presentations."""
-        package_type = state % self.PACKAGE_TYPES
-        state //= self.PACKAGE_TYPES
-        dropoff_index = state % len(self.dropoff_locations)
-        state //= len(self.dropoff_locations)
-        pickup_index = state % len(self.pickup_locations)
-        state //= len(self.pickup_locations)
-        carrying = bool(state % 2)
-        state //= 2
-        y = state % self.grid_size
-        x = state // self.grid_size
+        perm_idx = state % self._num_perms
+        state //= self._num_perms
+        pkg_code = state % self._status_combos
+        pos = state // self._status_combos
+        y = pos % self.grid_size
+        x = pos // self.grid_size
         return {
             "x": int(x),
             "y": int(y),
-            "carrying_package": carrying,
-            "pickup_index": int(pickup_index),
-            "dropoff_index": int(dropoff_index),
-            "package_type": int(package_type),
+            "package_status": self._decode_pkg_status(pkg_code),
+            "perm_index": int(perm_idx),
         }
 
     def _get_info(self) -> dict[str, Any]:
+        status_names = {0: "waiting", 1: "carried", 2: "delivered"}
         return {
             "robot_position": tuple(int(v) for v in self.robot_position),
-            "pickup_position": self.pickup_position,
-            "dropoff_position": self.dropoff_position,
-            "carrying_package": self.carrying_package,
             "is_success": self.delivered,
             "steps_taken": self.steps_taken,
             "last_event": self.last_event,
-            "package_type": int(self.package_type),
+            "num_carrying": self.num_carrying,
+            "num_delivered": self.num_delivered,
+            "package_status": [
+                {
+                    "id": i,
+                    "pickup": self.pickup_locations[i],
+                    "dropoff": self._pkg_dropoff(i),
+                    "status": status_names[self.package_status[i]],
+                }
+                for i in range(self.num_packages)
+            ],
         }
 
     def _is_inside_grid(self, position: np.ndarray) -> bool:
@@ -206,8 +224,16 @@ class DeliveryEnv(gym.Env):
         x, y = (int(v) for v in position)
         return (x, y) in self.buildings
 
+    def _is_grass(self, position: np.ndarray | tuple[int, int]) -> bool:
+        x, y = (int(v) for v in position)
+        return (x, y) in self.grass_cells
+
     def _is_valid_position(self, position: np.ndarray) -> bool:
-        return self._is_inside_grid(position) and not self._is_building(position)
+        return (
+            self._is_inside_grid(position)
+            and not self._is_building(position)
+            and not self._is_grass(position)
+        )
 
     def reset(
         self,
@@ -218,35 +244,19 @@ class DeliveryEnv(gym.Env):
         super().reset(seed=seed)
 
         options = options or {}
-        self.pickup_index = int(
-            options.get(
-                "pickup_index",
-                self.np_random.integers(len(self.pickup_locations)),
-            )
-        )
-        self.dropoff_index = int(
-            options.get(
-                "dropoff_index",
-                self.np_random.integers(len(self.dropoff_locations)),
-            )
-        )
-        self.package_type = int(
-            options.get(
-                "package_type",
-                self.np_random.integers(self.PACKAGE_TYPES),
-            )
-        )
+
+        # All 4 packages start as waiting; shuffle the dropoff permutation.
+        self.package_status = [0] * self.num_packages
+        self.perm_index = int(self.np_random.integers(self._num_perms))
 
         if "start_position" in options:
             start = tuple(options["start_position"])
             if start not in self.valid_start_locations:
                 raise ValueError(f"Invalid start position: {start}")
         elif options.get("random_start", False):
-            blocked_service_cells = {self.pickup_position, self.dropoff_position}
             valid_starts = [
-                position
-                for position in self.valid_start_locations
-                if position not in blocked_service_cells
+                p for p in self.valid_start_locations
+                if p not in set(self.pickup_locations)
             ]
             start = valid_starts[int(self.np_random.integers(len(valid_starts)))]
         else:
@@ -254,7 +264,6 @@ class DeliveryEnv(gym.Env):
 
         self.robot_position = np.array(start, dtype=np.int8)
 
-        self.carrying_package = False
         self.delivered = False
         self.steps_taken = 0
         self.last_event = "reset"
@@ -271,6 +280,8 @@ class DeliveryEnv(gym.Env):
         self.steps_taken += 1
         self.last_event = self.ACTION_NAMES.get(action, "unknown")
 
+        pos = tuple(int(v) for v in self.robot_position)
+
         if action in self.ACTIONS:
             next_position = self.robot_position + self.ACTIONS[action]
             if self._is_valid_position(next_position):
@@ -279,23 +290,38 @@ class DeliveryEnv(gym.Env):
                 reward = self.ILLEGAL_REWARD
                 self.last_event = "blocked"
         elif action == 4:
-            if not self.carrying_package and tuple(self.robot_position) == self.pickup_position:
-                self.carrying_package = True
-                reward = self.PICKUP_REWARDS[self.package_type]
-                self.last_event = "picked_up"
-            else:
+            # Pickup: find a waiting package at the robot's current cell.
+            picked = False
+            if self.num_carrying < self.max_carry:
+                for i in range(self.num_packages):
+                    if self.package_status[i] == 0 and self.pickup_locations[i] == pos:
+                        self.package_status[i] = 1
+                        reward = self.PICKUP_REWARD
+                        self.last_event = f"picked_up_{i}"
+                        picked = True
+                        break
+            if not picked:
                 reward = self.ILLEGAL_REWARD
                 self.last_event = "illegal_pickup"
         elif action == 5:
-            if self.carrying_package and tuple(self.robot_position) == self.dropoff_position:
-                self.carrying_package = False
-                self.delivered = True
-                terminated = True
-                reward = self.DROPOFF_REWARDS[self.package_type]
-                self.last_event = "delivered"
-            else:
+            # Dropoff: deliver a carried package whose dropoff matches.
+            dropped = False
+            for i in range(self.num_packages):
+                if self.package_status[i] == 1 and self._pkg_dropoff(i) == pos:
+                    self.package_status[i] = 2
+                    reward = self.DROPOFF_REWARD
+                    self.last_event = f"delivered_{i}"
+                    dropped = True
+                    break
+            if not dropped:
                 reward = self.ILLEGAL_REWARD
                 self.last_event = "illegal_dropoff"
+
+            # Check if all packages are delivered.
+            if self.num_delivered >= self.num_packages:
+                self.delivered = True
+                terminated = True
+                self.last_event = "all_delivered"
         else:
             reward = self.ILLEGAL_REWARD
             self.last_event = "invalid_action"
@@ -378,15 +404,6 @@ class DeliveryEnv(gym.Env):
             "robot": (255, 126, 41),
             "robot_loaded": (255, 156, 52),
             "package": (255, 214, 64),
-            "package_red": (230, 60, 60),
-            "package_red_inner": (250, 100, 100),
-            "package_red_stripe": (180, 40, 40),
-            "package_blue": (60, 100, 230),
-            "package_blue_inner": (100, 140, 250),
-            "package_blue_stripe": (40, 70, 180),
-            "package_yellow": (240, 200, 50),
-            "package_yellow_inner": (255, 232, 116),
-            "package_yellow_stripe": (178, 132, 32),
             "dropoff": (64, 226, 122),
             "dropoff_dark": (25, 130, 70),
             "crosswalk": (231, 235, 240),
@@ -405,7 +422,8 @@ class DeliveryEnv(gym.Env):
 
         road_rows = {0, 4, 5, 9}
         road_cols = {0, 4, 5, 9}
-        service_cells = {self.pickup_position, self.dropoff_position, self.depot_position}
+        # Collect all active service cells for planter exclusion
+        service_cells = set(self.pickup_locations) | set(self.dropoff_locations) | {self.depot_position}
 
         for y in range(self.grid_size):
             for x in range(self.grid_size):
@@ -434,10 +452,19 @@ class DeliveryEnv(gym.Env):
             if position not in service_cells:
                 self._draw_streetlight(surface, position, colors)
 
-        self._draw_dropoff(surface, colors)
+        # Draw dropoff markers for non-delivered packages
+        for i in range(self.num_packages):
+            if self.package_status[i] != 2:  # not delivered
+                bright = self.package_status[i] == 1  # carried = bright
+                self._draw_dropoff_marker(
+                    surface, self._pkg_dropoff(i),
+                    self.package_colors[i], bright, colors,
+                )
 
-        if not self.carrying_package and not self.delivered:
-            self._draw_package(surface, self.pickup_position, colors)
+        # Draw waiting packages at their pickup locations
+        for i in range(self.num_packages):
+            if self.package_status[i] == 0:
+                self._draw_package(surface, self.pickup_locations[i], self.package_colors[i])
 
         self._draw_robot(surface, colors)
 
@@ -721,57 +748,53 @@ class DeliveryEnv(gym.Env):
             self._pygame.draw.rect(surface, color, stripe)
             start_x += stripe_width + gap
 
-    def _draw_dropoff(self, surface, colors: dict[str, tuple[int, int, int]]) -> None:
-        x, y = self.dropoff_position
+    def _draw_dropoff_marker(
+        self,
+        surface,
+        position: tuple[int, int],
+        color: tuple[int, int, int],
+        bright: bool,
+        colors: dict[str, tuple[int, int, int]],
+    ) -> None:
+        """Draw a crosshair dropoff marker at *position* in the given color."""
+        x, y = position
         rect = self._cell_rect(x, y)
         pulse = (math.sin(self.steps_taken * 0.65) + 1.0) / 2.0
-        size = int(self.cell_size * (0.48 + 0.16 * pulse))
+        size = int(self.cell_size * (0.48 + 0.16 * pulse)) if bright else int(self.cell_size * 0.40)
         target = self._pygame.Rect(0, 0, size, size)
         target.center = rect.center
 
         pygame = self._pygame
-        glow = pygame.Surface((self.window_size, self.window_size), pygame.SRCALPHA)
-        pygame.draw.circle(
-            glow,
-            (*colors["dropoff"], int(42 + 34 * pulse)),
-            rect.center,
-            int(self.cell_size * (0.42 + 0.12 * pulse)),
-        )
-        surface.blit(glow, (0, 0))
-        pygame.draw.rect(surface, colors["dropoff_dark"], target.inflate(10, 10), width=3)
-        pygame.draw.rect(surface, colors["dropoff"], target, width=4)
-        pygame.draw.line(surface, colors["dropoff"], target.midtop, target.midbottom, 2)
-        pygame.draw.line(surface, colors["dropoff"], target.midleft, target.midright, 2)
+        if bright:
+            glow = pygame.Surface((self.window_size, self.window_size), pygame.SRCALPHA)
+            pygame.draw.circle(
+                glow, (*color, int(42 + 34 * pulse)),
+                rect.center, int(self.cell_size * (0.42 + 0.12 * pulse)),
+            )
+            surface.blit(glow, (0, 0))
+
+        dark = tuple(max(0, c - 50) for c in color)
+        pygame.draw.rect(surface, dark, target.inflate(10, 10), width=3)
+        pygame.draw.rect(surface, color, target, width=4)
+        pygame.draw.line(surface, color, target.midtop, target.midbottom, 2)
+        pygame.draw.line(surface, color, target.midleft, target.midright, 2)
 
     def _draw_package(
         self,
         surface,
         position: tuple[int, int],
-        colors: dict[str, tuple[int, int, int]],
+        color: tuple[int, int, int],
     ) -> None:
         rect = self._cell_rect(*position)
         package = self._pygame.Rect(0, 0, self.cell_size // 2, self.cell_size // 2)
         package.center = rect.center
-        
-        if self.package_type == 0:
-            main_color = colors["package_red"]
-            inner_color = colors["package_red_inner"]
-            stripe_color = colors["package_red_stripe"]
-        elif self.package_type == 1:
-            main_color = colors["package_blue"]
-            inner_color = colors["package_blue_inner"]
-            stripe_color = colors["package_blue_stripe"]
-        else:
-            main_color = colors["package_yellow"]
-            inner_color = colors["package_yellow_inner"]
-            stripe_color = colors["package_yellow_stripe"]
-
-        self._pygame.draw.rect(surface, colors["outline"], package.inflate(4, 4))
-        self._pygame.draw.rect(surface, main_color, package)
-        self._pygame.draw.rect(surface, inner_color, package.inflate(-8, -8))
+        lighter = tuple(min(255, c + 40) for c in color)
+        self._pygame.draw.rect(surface, (22, 24, 29), package.inflate(4, 4))
+        self._pygame.draw.rect(surface, color, package)
+        self._pygame.draw.rect(surface, lighter, package.inflate(-8, -8))
         self._pygame.draw.line(
             surface,
-            stripe_color,
+            tuple(max(0, c - 80) for c in color),
             package.midleft,
             package.midright,
             2,
@@ -781,7 +804,8 @@ class DeliveryEnv(gym.Env):
         rect = self._cell_rect(*tuple(int(v) for v in self.robot_position))
         body = self._pygame.Rect(0, 0, self.cell_size - 20, self.cell_size - 20)
         body.center = rect.center
-        color = colors["robot_loaded"] if self.carrying_package else colors["robot"]
+        loaded = self.num_carrying > 0
+        color = colors["robot_loaded"] if loaded else colors["robot"]
 
         pygame = self._pygame
         pygame.draw.rect(surface, colors["outline"], body.inflate(6, 6), border_radius=7)
@@ -805,19 +829,15 @@ class DeliveryEnv(gym.Env):
         pygame.draw.circle(surface, (85, 91, 102), (body.left + 8, wheel_y), 2)
         pygame.draw.circle(surface, (85, 91, 102), (body.right - 8, wheel_y), 2)
 
-        if self.carrying_package:
-            package = pygame.Rect(0, 0, self.cell_size // 3, self.cell_size // 4)
-            package.center = (body.centerx, body.top - 3)
-            
-            if self.package_type == 0:
-                main_color = colors["package_red"]
-            elif self.package_type == 1:
-                main_color = colors["package_blue"]
-            else:
-                main_color = colors["package_yellow"]
-                
-            pygame.draw.rect(surface, colors["outline"], package.inflate(4, 4))
-            pygame.draw.rect(surface, main_color, package)
+        # Draw small colored squares on top for each carried package
+        carried = [i for i in range(self.num_packages) if self.package_status[i] == 1]
+        pkg_w = self.cell_size // 4
+        pkg_h = self.cell_size // 5
+        start_x = body.centerx - (len(carried) * (pkg_w + 2)) // 2
+        for idx, pkg_id in enumerate(carried):
+            pkg_rect = pygame.Rect(start_x + idx * (pkg_w + 2), body.top - 6, pkg_w, pkg_h)
+            pygame.draw.rect(surface, colors["outline"], pkg_rect.inflate(3, 3))
+            pygame.draw.rect(surface, self.package_colors[pkg_id], pkg_rect)
 
 
 if "DeliveryBot-v0" not in registry:
