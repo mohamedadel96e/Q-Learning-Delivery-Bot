@@ -31,23 +31,18 @@ class DeliveryEnv(gym.Env):
         3: "right",
         4: "pickup",
         5: "dropoff",
+        6: "wait",
     }
 
     STEP_REWARD = config.STEP_REWARD
     ILLEGAL_REWARD = config.ILLEGAL_REWARD
-    
-    # 3 package types: 0=red, 1=blue, 2=yellow
-    PACKAGE_TYPES = config.PACKAGE_TYPES
-    PICKUP_REWARDS = {
-        0: config.RED_PICKUP_REWARD,
-        1: config.BLUE_PICKUP_REWARD,
-        2: config.YELLOW_PICKUP_REWARD,
-    }
-    DROPOFF_REWARDS = {
-        0: config.RED_DROPOFF_REWARD,
-        1: config.BLUE_DROPOFF_REWARD,
-        2: config.YELLOW_DROPOFF_REWARD,
-    }
+    PICKUP_REWARD = config.PICKUP_REWARD
+    DROPOFF_REWARD = config.DROPOFF_REWARD
+    RED_LIGHT_PENALTY = config.RED_LIGHT_PENALTY
+    YELLOW_LIGHT_PENALTY = config.YELLOW_LIGHT_PENALTY
+
+    TRAFFIC_LIGHT_CYCLE = config.TRAFFIC_LIGHT_CYCLE_STEPS
+    TRAFFIC_LIGHT_PHASES = config.TRAFFIC_LIGHT_PHASES  # green=0, yellow=1, red=2
 
     def __init__(
         self,
@@ -112,6 +107,9 @@ class DeliveryEnv(gym.Env):
             (1, 9),
             (8, 9),
         )
+        # Traffic-light intersection cells
+        self.traffic_light_cells = {(4, 4), (5, 4), (4, 5), (5, 5)}
+
         self.valid_start_locations = tuple(
             (x, y)
             for y in range(self.grid_size)
@@ -119,24 +117,24 @@ class DeliveryEnv(gym.Env):
             if (x, y) not in self.buildings
         )
 
-        self.action_space = spaces.Discrete(6)
+        # 7 actions: 4 moves + pickup + dropoff + wait
+        self.action_space = spaces.Discrete(7)
 
-        # The state is still one discrete value, but it also includes the
-        # active pickup/dropoff IDs so randomized jobs remain learnable.
+        # State encodes: position × carrying × pickup_id × dropoff_id × traffic_phase
         self.observation_space = spaces.Discrete(
             self.grid_size
             * self.grid_size
             * 2
             * len(self.pickup_locations)
             * len(self.dropoff_locations)
-            * self.PACKAGE_TYPES
+            * self.TRAFFIC_LIGHT_PHASES
         )
 
         self.robot_position = np.array([0, 0], dtype=np.int8)
         self.pickup_index = 0
         self.dropoff_index = 0
         self.carrying_package = False
-        self.package_type = 0  # 0=red, 1=blue, 2=yellow
+        self.traffic_phase = 0  # 0=green, 1=yellow, 2=red
         self.delivered = False
         self.steps_taken = 0
         self.last_event = "reset"
@@ -162,13 +160,13 @@ class DeliveryEnv(gym.Env):
         state = state * 2 + int(self.carrying_package)
         state = state * len(self.pickup_locations) + self.pickup_index
         state = state * len(self.dropoff_locations) + self.dropoff_index
-        state = state * self.PACKAGE_TYPES + self.package_type
+        state = state * self.TRAFFIC_LIGHT_PHASES + self.traffic_phase
         return int(state)
 
     def decode_state(self, state: int) -> dict[str, Any]:
         """Decode a discrete state index for debugging and presentations."""
-        package_type = state % self.PACKAGE_TYPES
-        state //= self.PACKAGE_TYPES
+        traffic_phase = state % self.TRAFFIC_LIGHT_PHASES
+        state //= self.TRAFFIC_LIGHT_PHASES
         dropoff_index = state % len(self.dropoff_locations)
         state //= len(self.dropoff_locations)
         pickup_index = state % len(self.pickup_locations)
@@ -183,10 +181,11 @@ class DeliveryEnv(gym.Env):
             "carrying_package": carrying,
             "pickup_index": int(pickup_index),
             "dropoff_index": int(dropoff_index),
-            "package_type": int(package_type),
+            "traffic_phase": int(traffic_phase),
         }
 
     def _get_info(self) -> dict[str, Any]:
+        phase_names = {0: "green", 1: "yellow", 2: "red"}
         return {
             "robot_position": tuple(int(v) for v in self.robot_position),
             "pickup_position": self.pickup_position,
@@ -195,7 +194,7 @@ class DeliveryEnv(gym.Env):
             "is_success": self.delivered,
             "steps_taken": self.steps_taken,
             "last_event": self.last_event,
-            "package_type": int(self.package_type),
+            "traffic_phase": phase_names[self.traffic_phase],
         }
 
     def _is_inside_grid(self, position: np.ndarray) -> bool:
@@ -230,12 +229,6 @@ class DeliveryEnv(gym.Env):
                 self.np_random.integers(len(self.dropoff_locations)),
             )
         )
-        self.package_type = int(
-            options.get(
-                "package_type",
-                self.np_random.integers(self.PACKAGE_TYPES),
-            )
-        )
 
         if "start_position" in options:
             start = tuple(options["start_position"])
@@ -257,12 +250,21 @@ class DeliveryEnv(gym.Env):
         self.carrying_package = False
         self.delivered = False
         self.steps_taken = 0
+        self.traffic_phase = 0
         self.last_event = "reset"
 
         if self.render_mode == "human":
             self.render()
 
         return self._encode_state(), self._get_info()
+
+    def _advance_traffic_light(self) -> None:
+        """Cycle the traffic light phase every TRAFFIC_LIGHT_CYCLE steps."""
+        if self.steps_taken % self.TRAFFIC_LIGHT_CYCLE == 0:
+            self.traffic_phase = (self.traffic_phase + 1) % self.TRAFFIC_LIGHT_PHASES
+
+    def _is_on_traffic_light(self) -> bool:
+        return tuple(int(v) for v in self.robot_position) in self.traffic_light_cells
 
     def step(self, action: int) -> tuple[int, int, bool, bool, dict[str, Any]]:
         action = int(action)
@@ -271,17 +273,31 @@ class DeliveryEnv(gym.Env):
         self.steps_taken += 1
         self.last_event = self.ACTION_NAMES.get(action, "unknown")
 
-        if action in self.ACTIONS:
+        # Advance the traffic light cycle
+        self._advance_traffic_light()
+
+        if action == 6:
+            # Wait action — stay in place, only costs the base step reward
+            self.last_event = "wait"
+        elif action in self.ACTIONS:
             next_position = self.robot_position + self.ACTIONS[action]
             if self._is_valid_position(next_position):
                 self.robot_position = next_position.astype(np.int8)
+                # Apply traffic-light penalties when entering an intersection
+                if self._is_on_traffic_light():
+                    if self.traffic_phase == 2:  # red
+                        reward += self.RED_LIGHT_PENALTY
+                        self.last_event = "ran_red_light"
+                    elif self.traffic_phase == 1:  # yellow
+                        reward += self.YELLOW_LIGHT_PENALTY
+                        self.last_event = "ran_yellow_light"
             else:
                 reward = self.ILLEGAL_REWARD
                 self.last_event = "blocked"
         elif action == 4:
             if not self.carrying_package and tuple(self.robot_position) == self.pickup_position:
                 self.carrying_package = True
-                reward = self.PICKUP_REWARDS[self.package_type]
+                reward = self.PICKUP_REWARD
                 self.last_event = "picked_up"
             else:
                 reward = self.ILLEGAL_REWARD
@@ -291,7 +307,7 @@ class DeliveryEnv(gym.Env):
                 self.carrying_package = False
                 self.delivered = True
                 terminated = True
-                reward = self.DROPOFF_REWARDS[self.package_type]
+                reward = self.DROPOFF_REWARD
                 self.last_event = "delivered"
             else:
                 reward = self.ILLEGAL_REWARD
@@ -378,15 +394,6 @@ class DeliveryEnv(gym.Env):
             "robot": (255, 126, 41),
             "robot_loaded": (255, 156, 52),
             "package": (255, 214, 64),
-            "package_red": (230, 60, 60),
-            "package_red_inner": (250, 100, 100),
-            "package_red_stripe": (180, 40, 40),
-            "package_blue": (60, 100, 230),
-            "package_blue_inner": (100, 140, 250),
-            "package_blue_stripe": (40, 70, 180),
-            "package_yellow": (240, 200, 50),
-            "package_yellow_inner": (255, 232, 116),
-            "package_yellow_stripe": (178, 132, 32),
             "dropoff": (64, 226, 122),
             "dropoff_dark": (25, 130, 70),
             "crosswalk": (231, 235, 240),
@@ -429,6 +436,8 @@ class DeliveryEnv(gym.Env):
         for position in self.planter_locations:
             if position not in service_cells:
                 self._draw_planter(surface, position, colors)
+
+        self._draw_traffic_signals(surface, colors)
 
         for position in self.streetlight_locations:
             if position not in service_cells:
@@ -683,6 +692,42 @@ class DeliveryEnv(gym.Env):
             leaf_color = colors["leaf"] if index != 1 else colors["leaf_dark"]
             pygame.draw.circle(surface, leaf_color, center, self.cell_size // 8)
 
+    def _draw_traffic_signals(
+        self,
+        surface,
+        colors: dict[str, tuple[int, int, int]],
+    ) -> None:
+        """Draw traffic signals with the currently active phase highlighted."""
+        pygame = self._pygame
+        # Dimmed versions of each light when not active
+        dim_red = (80, 30, 30)
+        dim_yellow = (80, 65, 25)
+        dim_green = (25, 70, 45)
+
+        # Active colors based on current phase
+        red_color = colors["signal_red"] if self.traffic_phase == 2 else dim_red
+        yellow_color = colors["signal_yellow"] if self.traffic_phase == 1 else dim_yellow
+        green_color = colors["signal_green"] if self.traffic_phase == 0 else dim_green
+
+        for x, y in ((4, 4), (5, 4), (4, 5), (5, 5)):
+            rect = self._cell_rect(x, y)
+            box = pygame.Rect(0, 0, 12, 28)
+            box.center = (rect.centerx, rect.centery)
+            pygame.draw.rect(surface, colors["outline"], box, border_radius=3)
+            pygame.draw.circle(surface, red_color, (box.centerx, box.top + 6), 4)
+            pygame.draw.circle(surface, yellow_color, box.center, 4)
+            pygame.draw.circle(surface, green_color, (box.centerx, box.bottom - 6), 4)
+
+            # Glow effect for the active light
+            glow = pygame.Surface((self.window_size, self.window_size), pygame.SRCALPHA)
+            if self.traffic_phase == 0:
+                pygame.draw.circle(glow, (*colors["signal_green"], 40), (box.centerx, box.bottom - 6), 10)
+            elif self.traffic_phase == 1:
+                pygame.draw.circle(glow, (*colors["signal_yellow"], 40), box.center, 10)
+            else:
+                pygame.draw.circle(glow, (*colors["signal_red"], 40), (box.centerx, box.top + 6), 10)
+            surface.blit(glow, (0, 0))
+
     def _draw_streetlight(
         self,
         surface,
@@ -752,26 +797,12 @@ class DeliveryEnv(gym.Env):
         rect = self._cell_rect(*position)
         package = self._pygame.Rect(0, 0, self.cell_size // 2, self.cell_size // 2)
         package.center = rect.center
-        
-        if self.package_type == 0:
-            main_color = colors["package_red"]
-            inner_color = colors["package_red_inner"]
-            stripe_color = colors["package_red_stripe"]
-        elif self.package_type == 1:
-            main_color = colors["package_blue"]
-            inner_color = colors["package_blue_inner"]
-            stripe_color = colors["package_blue_stripe"]
-        else:
-            main_color = colors["package_yellow"]
-            inner_color = colors["package_yellow_inner"]
-            stripe_color = colors["package_yellow_stripe"]
-
         self._pygame.draw.rect(surface, colors["outline"], package.inflate(4, 4))
-        self._pygame.draw.rect(surface, main_color, package)
-        self._pygame.draw.rect(surface, inner_color, package.inflate(-8, -8))
+        self._pygame.draw.rect(surface, colors["package"], package)
+        self._pygame.draw.rect(surface, (255, 232, 116), package.inflate(-8, -8))
         self._pygame.draw.line(
             surface,
-            stripe_color,
+            (178, 132, 32),
             package.midleft,
             package.midright,
             2,
@@ -808,16 +839,8 @@ class DeliveryEnv(gym.Env):
         if self.carrying_package:
             package = pygame.Rect(0, 0, self.cell_size // 3, self.cell_size // 4)
             package.center = (body.centerx, body.top - 3)
-            
-            if self.package_type == 0:
-                main_color = colors["package_red"]
-            elif self.package_type == 1:
-                main_color = colors["package_blue"]
-            else:
-                main_color = colors["package_yellow"]
-                
             pygame.draw.rect(surface, colors["outline"], package.inflate(4, 4))
-            pygame.draw.rect(surface, main_color, package)
+            pygame.draw.rect(surface, colors["package"], package)
 
 
 if "DeliveryBot-v0" not in registry:
