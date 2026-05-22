@@ -15,36 +15,26 @@ from pathlib import Path
 # ──────────────────────────────────────
 ENV_ID = "DeliveryBot-v0"
 GRID_SIZE = 10
-MAX_STEPS_PER_EPISODE = 200
+MAX_STEPS_PER_EPISODE = 400
+NUM_PACKAGES = 4
+MAX_CARRY = 2
 
 # ──────────────────────────────────────
 # Reward shaping
 # ──────────────────────────────────────
 STEP_REWARD = -1
 ILLEGAL_REWARD = -10
-
-# Red (Highest)
-RED_PICKUP_REWARD = 40
-RED_DROPOFF_REWARD = 200
-
-# Blue (Mid)
-BLUE_PICKUP_REWARD = 20
-BLUE_DROPOFF_REWARD = 100
-
-# Yellow (Lowest)
-YELLOW_PICKUP_REWARD = 10
-YELLOW_DROPOFF_REWARD = 50
-
-PACKAGE_TYPES = 3  # 0=red, 1=blue, 2=yellow
+PICKUP_REWARD = 20
+DROPOFF_REWARD = 100
 
 # ──────────────────────────────────────
 # Q-Learning hyperparameters
 # ──────────────────────────────────────
-TOTAL_EPISODES = 12_000
+TOTAL_EPISODES = 50_000
 LEARNING_RATE = 0.1
 DISCOUNT_FACTOR = 0.99
 EPSILON_START = 1.0
-EPSILON_DECAY = 0.9995
+EPSILON_DECAY = 0.9999
 EPSILON_MIN = 0.01
 RANDOM_SEED = 7
 TRAINING_LOG_INTERVAL = 500

@@ -41,12 +41,9 @@ def run_demo(
     for episode in range(1, episodes + 1):
         state, info = env.reset(seed=seed + episode)
         total_reward = 0
-        colors = {0: "red", 1: "blue", 2: "yellow"}
-        print(
-            f"Demo {episode}: pickup {info['pickup_position']} -> "
-            f"dropoff {info['dropoff_position']} | "
-            f"package: {colors.get(info['package_type'])}"
-        )
+        print(f"\nDemo {episode} ({len(info['package_status'])} packages, max carry {config.MAX_CARRY}):")
+        for pkg in info["package_status"]:
+            print(f"  Pkg {pkg['id']}: {pkg['pickup']} -> {pkg['dropoff']} [{pkg['status']}]")
 
         for step in range(1, max_steps + 1):
             action = greedy_action(q_table[state], rng)
